@@ -1,8 +1,9 @@
-FROM quay.io/keycloak/keycloak:latest
+FROM quay.io/keycloak/keycloak:26.0.7
 
-COPY docker-entrypoint.sh /opt/jboss/tools
+USER root
+COPY docker-entrypoint.sh /opt/keycloak/bin/dokku-entrypoint.sh
+RUN chmod +x /opt/keycloak/bin/dokku-entrypoint.sh \
+  && chown keycloak:root /opt/keycloak/bin/dokku-entrypoint.sh
 
-EXPOSE 80
-
-ENTRYPOINT [ "/opt/jboss/tools/docker-entrypoint.sh" ]
-CMD ["-b", "0.0.0.0"]
+USER keycloak
+ENTRYPOINT ["/opt/keycloak/bin/dokku-entrypoint.sh"]
