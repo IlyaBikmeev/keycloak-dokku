@@ -1,192 +1,40 @@
 #!/bin/bash
+set -euo pipefail
 
-# Set database config from Heroku DATABASE_URL
-if [ "$DATABASE_URL" != "" ]; then
-    echo "Found database configuration in DATABASE_URL=$DATABASE_URL"
+# Dokku / Heroku: слушаем порт из окружения
+export KC_HTTP_PORT="${PORT:-8080}"
 
-    regex='^postgres://([a-zA-Z0-9_-]+):([a-zA-Z0-9]+)@([a-z0-9.-]+):([[:digit:]]+)/([a-zA-Z0-9_-]+)$'
-    if [[ $DATABASE_URL =~ $regex ]]; then
-        export DB_ADDR=${BASH_REMATCH[3]}
-        export DB_PORT=${BASH_REMATCH[4]}
-        export DB_DATABASE=${BASH_REMATCH[5]}
-        export DB_USER=${BASH_REMATCH[1]}
-        export DB_PASSWORD=${BASH_REMATCH[2]}
-
-        echo "DB_ADDR=$DB_ADDR, DB_PORT=$DB_PORT, DB_DATABASE=$DB_DATABASE, DB_USER=$DB_USER, DB_PASSWORD=$DB_PASSWORD"
-        export DB_VENDOR=postgres
-    fi
-
+# Совместимость со старым README: KEYCLOAK_USER / KEYCLOAK_PASSWORD
+if [[ -n "${KEYCLOAK_USER:-}" && -n "${KEYCLOAK_PASSWORD:-}" ]]; then
+  export KEYCLOAK_ADMIN="${KEYCLOAK_ADMIN:-$KEYCLOAK_USER}"
+  export KEYCLOAK_ADMIN_PASSWORD="${KEYCLOAK_ADMIN_PASSWORD:-$KEYCLOAK_PASSWORD}"
 fi
 
-# usage: file_env VAR [DEFAULT]
-#    ie: file_env 'XYZ_DB_PASSWORD' 'example'
-# (will allow for "$XYZ_DB_PASSWORD_FILE" to fill in the value of
-#  "$XYZ_DB_PASSWORD" from a file, especially for Docker's secrets feature)
-file_env() {
-	local var="$1"
-	local fileVar="${var}_FILE"
-	local def="${2:-}"
-	if [ "${!var:-}" ] && [ "${!fileVar:-}" ]; then
-		echo >&2 "error: both $var and $fileVar are set (but are exclusive)"
-		exit 1
-	fi
-	local val="$def"
-	if [ "${!var:-}" ]; then
-		val="${!var}"
-	elif [ "${!fileVar:-}" ]; then
-		val="$(< "${!fileVar}")"
-	fi
-	export "$var"="$val"
-	unset "$fileVar"
-}
-
-##################
-# Add admin user #
-##################
-
-file_env 'KEYCLOAK_USER'
-file_env 'KEYCLOAK_PASSWORD'
-
-if [ $KEYCLOAK_USER ] && [ $KEYCLOAK_PASSWORD ]; then
-    /opt/jboss/keycloak/bin/add-user-keycloak.sh --user $KEYCLOAK_USER --password $KEYCLOAK_PASSWORD
+# Совместимость: PROXY_ADDRESS_FORWARDING=true -> trust X-Forwarded-* от nginx Dokku
+if [[ "${PROXY_ADDRESS_FORWARDING:-}" == "true" ]]; then
+  export KC_PROXY_HEADERS="${KC_PROXY_HEADERS:-xforwarded}"
 fi
 
-############
-# Hostname #
-############
-
-if [ "$KEYCLOAK_HOSTNAME" != "" ]; then
-    SYS_PROPS="-Dkeycloak.hostname.provider=fixed -Dkeycloak.hostname.fixed.hostname=$KEYCLOAK_HOSTNAME"
-
-    if [ "$KEYCLOAK_HTTP_PORT" != "" ]; then
-        SYS_PROPS+=" -Dkeycloak.hostname.fixed.httpPort=$KEYCLOAK_HTTP_PORT"
-    fi
-
-    if [ "$KEYCLOAK_HTTPS_PORT" != "" ]; then
-        SYS_PROPS+=" -Dkeycloak.hostname.fixed.httpsPort=$KEYCLOAK_HTTPS_PORT"
-    fi
+# Совместимость: KEYCLOAK_HOSTNAME из README
+if [[ -n "${KEYCLOAK_HOSTNAME:-}" ]]; then
+  export KC_HOSTNAME="${KC_HOSTNAME:-$KEYCLOAK_HOSTNAME}"
 fi
 
-################
-# Realm import #
-################
+# Часто нужно за reverse proxy (при проблемах с редиректами — оставь true)
+export KC_HOSTNAME_STRICT="${KC_HOSTNAME_STRICT:-false}"
 
-if [ "$KEYCLOAK_IMPORT" ]; then
-    SYS_PROPS+=" -Dkeycloak.import=$KEYCLOAK_IMPORT"
+# DATABASE_URL от dokku postgres:link → JDBC и KC_DB_*
+# Ограничение: пароль не должен содержать неэкранированный @ ; иначе задай KC_DB_* через dokku config:set
+if [[ -n "${DATABASE_URL:-}" ]]; then
+  if [[ "$DATABASE_URL" =~ ^postgres(ql)?://([^:]+):([^@]+)@([^/:]+):([0-9]+)/([^/?#]+) ]]; then
+    export KC_DB="${KC_DB:-postgres}"
+    export KC_DB_USERNAME="${KC_DB_USERNAME:-${BASH_REMATCH[2]}}"
+    export KC_DB_PASSWORD="${KC_DB_PASSWORD:-${BASH_REMATCH[3]}}"
+    export KC_DB_URL="${KC_DB_URL:-jdbc:postgresql://${BASH_REMATCH[4]}:${BASH_REMATCH[5]}/${BASH_REMATCH[6]}}"
+  else
+    echo "ERROR: не удалось разобрать DATABASE_URL, задай KC_DB_URL / KC_DB_USERNAME / KC_DB_PASSWORD вручную" >&2
+    exit 1
+  fi
 fi
 
-########################
-# JGroups bind options #
-########################
-
-if [ -z "$BIND" ]; then
-    BIND=$(hostname -i)
-fi
-if [ -z "$BIND_OPTS" ]; then
-    for BIND_IP in $BIND
-    do
-        BIND_OPTS+=" -Djboss.bind.address=$BIND_IP -Djboss.bind.address.private=$BIND_IP "
-    done
-fi
-SYS_PROPS+=" $BIND_OPTS"
-
-#################
-# Configuration #
-#################
-
-# If the server configuration parameter is not present, append the HA profile.
-if echo "$@" | egrep -v -- '-c |-c=|--server-config |--server-config='; then
-    SYS_PROPS+=" -c=standalone-ha.xml"
-fi
-
-############
-# DB setup #
-############
-
-file_env 'DB_USER'
-file_env 'DB_PASSWORD'
-
-# Lower case DB_VENDOR
-DB_VENDOR=`echo $DB_VENDOR | tr A-Z a-z`
-
-# Detect DB vendor from default host names
-if [ "$DB_VENDOR" == "" ]; then
-    if (getent hosts postgres &>/dev/null); then
-        export DB_VENDOR="postgres"
-    elif (getent hosts mysql &>/dev/null); then
-        export DB_VENDOR="mysql"
-    elif (getent hosts mariadb &>/dev/null); then
-        export DB_VENDOR="mariadb"
-    fi
-fi
-
-# Detect DB vendor from legacy `*_ADDR` environment variables
-if [ "$DB_VENDOR" == "" ]; then
-    if (printenv | grep '^POSTGRES_ADDR=' &>/dev/null); then
-        export DB_VENDOR="postgres"
-    elif (printenv | grep '^MYSQL_ADDR=' &>/dev/null); then
-        export DB_VENDOR="mysql"
-    elif (printenv | grep '^MARIADB_ADDR=' &>/dev/null); then
-        export DB_VENDOR="mariadb"
-    fi
-fi
-
-# Default to H2 if DB type not detected
-if [ "$DB_VENDOR" == "" ]; then
-    export DB_VENDOR="h2"
-fi
-
-# Set DB name
-case "$DB_VENDOR" in
-    postgres)
-        DB_NAME="PostgreSQL";;
-    mysql)
-        DB_NAME="MySQL";;
-    mariadb)
-        DB_NAME="MariaDB";;
-    h2)
-        DB_NAME="Embedded H2";;
-    *)
-        echo "Unknown DB vendor $DB_VENDOR"
-        exit 1
-esac
-
-# Append '?' in the beggining of the string if JDBC_PARAMS value isn't empty
-export JDBC_PARAMS=$(echo ${JDBC_PARAMS} | sed '/^$/! s/^/?/')
-
-# Convert deprecated DB specific variables
-function set_legacy_vars() {
-  local suffixes=(ADDR DATABASE USER PASSWORD PORT)
-  for suffix in "${suffixes[@]}"; do
-    local varname="$1_$suffix"
-    if [ ${!varname} ]; then
-      echo WARNING: $varname variable name is DEPRECATED replace with DB_$suffix
-      export DB_$suffix=${!varname}
-    fi
-  done
-}
-set_legacy_vars `echo $DB_VENDOR | tr a-z A-Z`
-
-# Configure DB
-
-echo "========================================================================="
-echo ""
-echo "  Using $DB_NAME database"
-echo ""
-echo "========================================================================="
-echo ""
-
-if [ "$DB_VENDOR" != "h2" ]; then
-    /bin/sh /opt/jboss/tools/databases/change-database.sh $DB_VENDOR
-fi
-
-/opt/jboss/tools/x509.sh
-/opt/jboss/tools/jgroups.sh $JGROUPS_DISCOVERY_PROTOCOL $JGROUPS_DISCOVERY_PROPERTIES
-/opt/jboss/tools/autorun.sh
-
-##################
-# Start Keycloak #
-##################
-
-exec /opt/jboss/keycloak/bin/standalone.sh $SYS_PROPS $@ -Djboss.http.port=$PORT 
-exit $?
+exec /opt/keycloak/bin/kc.sh start "$@"
