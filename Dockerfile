@@ -1,4 +1,4 @@
-FROM jboss/keycloak:latest
+FROM quay.io/keycloak/keycloak:latest
 
 COPY docker-entrypoint.sh /opt/jboss/tools
 
